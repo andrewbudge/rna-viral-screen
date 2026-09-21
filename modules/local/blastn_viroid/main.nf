@@ -13,9 +13,13 @@ process BLASTN_VIROID {
 
     script:
     """
-    blastn -db viroid_all_09_25_26_db -query ${contigs} -out ${meta.id}.viroid.tsv \
-      -task blastn -evalue 1e-5 -max_target_seqs 5 \
-      -outfmt '6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen qcovhsp scovhsp' \
-      -num_threads ${task.cpus}
+    if [ -s ${contigs} ]; then
+      blastn -db viroid_all_09_25_26_db -query ${contigs} -out ${meta.id}.viroid.tsv \\
+        -task blastn -evalue 1e-5 -max_target_seqs 5 \\
+        -outfmt '6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen qcovhsp scovhsp' \\
+        -num_threads ${task.cpus}
+    else
+      : > ${meta.id}.viroid.tsv
+    fi
     """
 }

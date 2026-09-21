@@ -10,6 +10,9 @@ process FILTER {
     output:
     tuple val(meta), path("${meta.id}.viroid_contigs.fasta"), emit: contigs_small
     tuple val(meta), path("${meta.id}.contigs.fasta"), emit: contigs_large
+    // Full filtered set (>=200 nt): the screening legs that are size-agnostic
+    // (UniRef90 confirmation, map-back) run on this, one task per sample.
+    tuple val(meta), path("${meta.id}.filtered_contigs.fasta"), emit: contigs_all
 
     script:
     """

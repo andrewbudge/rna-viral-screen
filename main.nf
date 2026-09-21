@@ -58,6 +58,9 @@ workflow {
     viroid_db_files = file("${db}/blastn/viroid_all_09_25_26_db.*", checkIfExists: true)
     if (!viroid_db_files.find { it.name.endsWith('.nin') } || !viroid_db_files.find { it.name.endsWith('.nsq') })
         error "viroid BLAST database is incomplete: ${db}/blastn/viroid_all_09_25_26_db.*"
+    viroid_seqids = file("${db}/blastn/*_seqids.txt")
+    if (!viroid_seqids)
+        error "viroid accession->description lookup missing: ${db}/blastn/*_seqids.txt"
     aggregate_script = file("${baseDir}/bin/aggregate_evidence.sh", checkIfExists: true)
 
     ch_samples = Channel
@@ -88,21 +91,22 @@ workflow {
     SORTMERNA(FASTP.out.reads, ch_ref, ch_idx)
     SPADES(SORTMERNA.out.clean)
     FILTER(SPADES.out.contigs)
-    screen_contigs = FILTER.out.contigs_small.mix(FILTER.out.contigs_large)
     DIAMOND_RVDB(FILTER.out.contigs_large, Channel.value(rvdb_prot_db))
-    DIAMOND_UNIREF90(screen_contigs, Channel.value(uniref90_db))
+    DIAMOND_UNIREF90(FILTER.out.contigs_all, Channel.value(uniref90_db))
     GENOMAD(FILTER.out.contigs_large, Channel.value(genomad_db))
-    BOWTIE2(SORTMERNA.out.clean.join(screen_contigs))
+    BOWTIE2(SORTMERNA.out.clean.join(FILTER.out.contigs_all))
     BLASTN_VIROID(FILTER.out.contigs_small, Channel.value(viroid_db_files))
     SAMTOOLS_SORT(BOWTIE2.out.sam)
     evidence_inputs = DIAMOND_RVDB.out.rvdb
         .join(DIAMOND_UNIREF90.out.uniref90)
         .join(GENOMAD.out.virus_summary)
         .join(SAMTOOLS_SORT.out.coverage)
+        .join(BLASTN_VIROID.out.viroid)
     EVIDENCE(
         evidence_inputs,
         Channel.value(rvdb_taxmap),
         Channel.value(uniref90_taxmap),
+        Channel.value(viroid_seqids),
         Channel.value(aggregate_script)
     )
     MULTIQC(

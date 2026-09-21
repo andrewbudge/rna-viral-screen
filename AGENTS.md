@@ -50,6 +50,7 @@ nextflow run andrewbudge/laney_plant_virus_pipeline -profile slurm|local \
   blastx/uniref90.taxmap.srt            # one-time cache (agg script sorts it); safe to delete
   blastx/U-RVDBv32.0-prot.taxmap.tsv    # protein FASTA header lookup: rvdb id, protein/nt accessions, organism, product
   blastx/U-RVDBv32.0-prot.taxmap.srt    # one-time sorted cache; safe to delete
+  blastn/*_seqids.txt                   # viroid accession -> description ("ACC rest-of-line"); required by evidence merge
   genomad/genomad_db/                   # genomad download-database output
 ```
 
@@ -85,7 +86,7 @@ FILTER's contigs, each feeds one raw per-leg TSV; blastn is deferred.
 | 2 | diamond blastx → U-RVDB-prot | divergent-virus homology (protein) (implemented) |
 | 3 | diamond blastx → UniRef90 | unbiased: is the best hit viral? (confirmation, implemented) |
 | 4 | geNomad | viral by sequence/marker signal, no homology needed (implemented, confirmed) |
-| 5 | blastn → viroid DB | viroid detection (contigs 200-500 bp) (implemented) |
+| 5 | blastn → viroid DB | viroid detection (contigs 200-450 bp) (implemented) |
 | support | bowtie2 map-back reads → contigs | per-contig read support and confidence for calls |
 
 Decisions made:
@@ -108,6 +109,16 @@ Decisions made:
 - **Map-back support is a confidence leg.** rRNA-depleted reads mapped back to
   filtered contigs support calls such as the RNA mitovirus; BAM enables
   `samtools depth`/`idxstats` for the deferred evidence table.
+- **Screening-leg channel rule (v0.2.3 fix):** FILTER emits three sets —
+  `contigs_all` (>=200nt, the union) drives UniRef90 + bowtie2 map-back;
+  `contigs_large` (>=1000nt) drives RVDB blastx + geNomad; `contigs_small`
+  (200-450bp) drives viroid blastn. Previously UniRef90/bowtie2 were fed a
+  `mix(small, large)` of two emissions per sample → two tasks writing the same
+  output name, publishDir overwrite, and duplicate join keys in EVIDENCE.
+- **Evidence table fixes in v0.2.3:** bowtie2 columns were off by one (took
+  `covbases..` where samtools coverage puts `numreads`), and the table grew
+  56→73 cols with the viroid leg (one row per HSP, sseqid + accession +
+  seqids.txt description + 14 blast fields).
 
 DBs needed (sources already staged in `<db>/blastx/` + user downloading):
 - U-RVDB v32.0 (rvdb.dbi.udel.edu), deferred → `makeblastdb -dbtype nucl -parse_seqids`
@@ -129,22 +140,24 @@ Notes: blastx >> blastn for sensitivity on divergent viruses (protein diverges
 ```
 <outdir>/
   01_fastp/<sample>/  02_sortmerna/<sample>/  03_spades/<sample>/
-  04_filter/<sample>/{<sample>.viroid_contigs.fasta,<sample>.contigs.fasta}
-                                               # viroid: 200-450 bp; standard: >=1000 bp; cov>=10
+  04_filter/<sample>/{<sample>.filtered_contigs.fasta,<sample>.viroid_contigs.fasta,<sample>.contigs.fasta}
+                                               # filtered: >=200nt cov>=10 (screening set); viroid: 200-450 bp; standard: >=1000 bp
   05_genomad/<sample>/{<sample>_virus_summary.tsv,<sample>_virus.fna,<sample>_virus_proteins.faa,<sample>_summary.json,*.genomad.log}
   06_bowtie2/<sample>/{*.sorted.bam,*.sorted.bam.bai,*.coverage.tsv,*.bowtie2.log}
   07_diamond/<sample>/{<sample>.rvdb.tsv,<sample>.uniref90.tsv}
-  08_multiqc/  evidence/<sample>.evidence.tsv   # 56-col joined table via bin/aggregate_evidence.sh
-  09_viroid/<sample>/<sample>.viroid.tsv   # optional blastn vs viroid DB (contigs 200-500 bp)
+  08_multiqc/  evidence/<sample>.evidence.tsv   # 73-col joined table via bin/aggregate_evidence.sh
+  09_viroid/<sample>/<sample>.viroid.tsv    # blastn vs viroid DB (contigs 200-450 bp), merged into evidence
   pipeline_info/{timeline,report,trace,dag}
 ```
 
 Evidence aggregation: `bin/aggregate_evidence.sh -s <sample> -o <outdir> -d <dbdir>`
-joins geNomad + diamond RVDB/UniRef90 + protein header taxmaps + bowtie2 coverage on
-contig name into a 56-col TSV (one row per union contig; repeated per RVDB hit
-when multiple hits exist). One-time sorted caches (`.srt`) auto-built in
-`<db>/blastx/` on first run. Final rows retain stream order; only join inputs
-and lookup caches are sorted as required by `join`.
+joins geNomad + diamond RVDB/UniRef90 + protein header taxmaps + bowtie2 coverage +
+viroid blastn on contig name into a 73-col TSV (one row per union contig; repeated per
+RVDB hit and per viroid HSP when multiple hits exist; each multi-row carries NA for the
+other multi-row leg). One-time sorted caches (`.srt`) auto-built in `<db>/blastx/` and
+`<db>/blastn/` on first run. Final rows retain stream order; only join inputs and lookup
+caches are sorted as required by `join`. The viroid leg joins sseqid (pipe-wrapped
+`gb|ACC|`) to `<db>/blastn/*_seqids.txt` for `viroid_accession` + `viroid_description`.
 
 Diamond outfmt carries only the subject seqid — the first header token before a
 space. RVDB-prot descriptions thus truncate to one word (e.g. `essential`,
