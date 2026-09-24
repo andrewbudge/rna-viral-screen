@@ -50,6 +50,10 @@ workflow {
     genomad_db = file("${db}/genomad/genomad_db")
     if (!genomad_db.isDirectory())
         error "geNomad database not found: ${genomad_db} — run 'genomad download-database <db>/genomad' to create it"
+    genomad_required = ['version.txt', 'genomad_db', 'nodes.dmp', 'names.dmp', 'genomad_marker_metadata.tsv']
+    genomad_missing = genomad_required.findAll { !new File(genomad_db.toString(), it).exists() }
+    if (genomad_missing)
+        error "geNomad database incomplete at ${genomad_db}: missing ${genomad_missing.join(', ')} — run 'genomad download-database <db>/genomad' to rebuild it"
 
     rvdb_prot_db = file("${db}/blastx/U-RVDB-prot.dmnd")
     uniref90_db = file("${db}/blastx/uniref90.dmnd")

@@ -119,6 +119,22 @@ Decisions made:
   `covbases..` where samtools coverage puts `numreads`), and the table grew
   56→73 cols with the viroid leg (one row per HSP, sseqid + accession +
   seqids.txt description + 14 blast fields).
+- **GENOMAD takes `val db`, not `path db` (2026-09-24).** `path db` stages a
+  symlink into the work dir and renders `${db}` *relative*, so any `rm` or
+  `find -type f` aimed at `genomad_db/` from inside a task walks straight
+  through into the shared database. The 2026-09-22 incident left
+  `<db>/genomad/genomad_db` holding exactly the 8 `genomad_mini_db*` symlinks
+  the tarball ships and zero regular files — a `-type f` delete signature,
+  not a staging bug. `val db` stages nothing and renders the absolute path.
+  Two guards now catch the two failure modes separately: the task asserts
+  `${db}/version.txt` *inside the container* (unbound path → message in
+  `<sample>.genomad.log`), and `main.nf` asserts `version.txt` + `genomad_db`
+  + `nodes.dmp` + `names.dmp` + `genomad_marker_metadata.tsv` at launch
+  (deleted DB → fails before any SLURM job). `conf/slurm.config`'s
+  `runOptions` bind now reaches geNomad on its own — do not drop it.
+  DIAMOND_* stay on `path db` (single `.dmnd` files, harmless) and SORTMERNA
+  stays on `path ref` (the index-basename constraint above depends on the
+  staged link name).
 
 DBs needed (sources already staged in `<db>/blastx/` + user downloading):
 - U-RVDB v32.0 (rvdb.dbi.udel.edu), deferred → `makeblastdb -dbtype nucl -parse_seqids`
@@ -205,6 +221,14 @@ the whole genome. staxids/sscinames stay blank without `makeblastdb -taxid_map`.
 - Absence confidence: positive spike-ins, defined detection limits, read
   downsampling, translated/profile-HMM sensitivity benchmarks, and replicate
   consistency. A negative screen cannot establish true virus absence.
+- **[PARKED 2026-09-22, pending PI feedback]** General-purpose viral genome
+  annotation CLI (Rust, clap, static): reference-transfer annotation +
+  readthrough-aware ORF calling (126K/183K class) + plant genetic code + GFF3/
+  .tbl/table2asn emission + MIUViG reporting fields. Gap evidence in
+  `~/literature/viral-annotation/` (VAPiD: Shean 2019 PMID 30674273 —
+  Python-2, human-virus-only, CDS-only, readthrough untested; Prodigal: Hyatt
+  2010 PMID 20211023 — start→first-stop model cannot emit readthrough CDS;
+  practice anchors: Zisi 2024 PMID 38774217, Esmaeilzadeh 2023 PMID 37894095).
 
 ## Verification workflow
 
