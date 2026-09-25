@@ -115,10 +115,87 @@ Decisions made:
   (200-450bp) drives viroid blastn. Previously UniRef90/bowtie2 were fed a
   `mix(small, large)` of two emissions per sample → two tasks writing the same
   output name, publishDir overwrite, and duplicate join keys in EVIDENCE.
-- **Evidence table fixes in v0.2.3:** bowtie2 columns were off by one (took
-  `covbases..` where samtools coverage puts `numreads`), and the table grew
-  56→73 cols with the viroid leg (one row per HSP, sseqid + accession +
-  seqids.txt description + 14 blast fields).
+- **Evidence table grew 56→73 cols in v0.2.3** with the viroid leg (one row per
+  HSP, sseqid + accession + seqids.txt description + 14 blast fields). The
+  v0.2.3 bowtie2 off-by-one was **not** actually fixed and survived into the
+  first production batch; see the 0.2.6 entry below.
+- **0.2.6 — two column bugs found by auditing the first 13 delivered
+  `<sample>.evidence.tsv` (2026-09-25). Both were silent; the run "passed".**
+  - **bowtie2 off-by-one, still present.** All six `bowtie2_*` columns held
+    their neighbour's value: `numreads`=endpos, `covbases`=numreads,
+    `coverage`=covbases, `meandepth`=coverage **percentage**,
+    `meanbaseq`=meandepth, `meanmapq`=meanbaseq. Proven on all 100,472 rows of
+    the delivered batch: `bowtie2_meandepth == bowtie2_coverage/len*100`
+    exactly, and `bowtie2_meanbaseq` tracks `contig_cov`. Any depth or
+    "percent covered" read off that batch is wrong; real read counts are in
+    `covbases`. Cause: `samtools coverage`'s column set is not stable across
+    releases (no `length` before 1.16) and the script read it positionally.
+    **Fix: `bin/aggregate_evidence.sh` now resolves the six columns by name
+    from the `#` header** and aborts if the header is absent or incomplete,
+    rather than guessing positions.
+  - **`viroid_scovhsp` was always empty.** blastn has **no subject-coverage
+    tag** — not `scovhsp`, not `scovs` — and unlike diamond it does not reject
+    an unknown tag: it **silently drops an unrecognised trailing tag** and
+    writes one fewer field. So the 16-field request produced 15 fields and the
+    column read NA downstream while the task exited 0. Verified against blastn
+    2.12.0 locally. **Fix: the viroid outfmt is 15 fields and
+    `viroid_scovhsp` is gone — the schema is 72 cols.** Do not re-add
+    `scovhsp` to `modules/local/blastn_viroid/main.nf`.
+  - All three legs now assert their field count and abort with the offending
+    filename, so a short leg can never again become a column of NAs. The
+    silent-drop behaviour is the general hazard here, not just this instance.
+  - `genomad_coordinates` is empty for every called contig and is **benign**:
+    geNomad leaves it blank for whole-contig (single-region) calls. Confirmed
+    the geNomad leg's column alignment is correct by checking three previously
+    unexamined columns in the delivered batch — `genomad_topology`
+    ("No terminal repeats"/"DTR"), `genomad_genetic_code` (11, 4) and
+    `genomad_marker_enrichment` (0.0000, 1.7183, 21.6357) all carry valid
+    geNomad values in the right slots.
+- **First batch (13 samples, 2026-09-25) screening read — do not re-derive.**
+  Host is *Cannabis sativa* (142 Cannabaceae + 60 *Cannabis sativa* UniRef90
+  best hits). Interpretation rules this batch established:
+  - **Genuine, orthogonal-leg-confirmed plant virus signal:**
+    Laney42 = *Clover yellow mosaic virus* RdRp 95.8% id, e=0.0, 6953 bp contig
+    at cov 59, geNomad agrees (Betaflexiviridae Quinvirinae) — strongest call in
+    the batch; also *Guapo partitivirus* coat 78.3%. Laney34 = *Guapo
+    partitivirus* coat 78.5%, cov 74.6. Laney20 = *Plant associated
+    deltapartitivirus 5* / *Marigold cryptic virus* RdRp ~76.8%, cov 686.
+    Laney19 = Partitiviridae RdRp 72%, cov 74.9. Laney40 = Mitoviridae
+    (*Cannabis sativa* / *Humulus lupulus* mitovirus 1 RdRp ~47%, cov 28001) —
+    plausible; mitoviruses infect plant-pathogenic fungi, so identity is low.
+  - **The viroid leg's only hits are Citrus exocortis viroid (CEVd)** —
+    `Laney40_63501` (295 bp, cov 108.6, 196 bp @ 84.7%, e=1.1e-56) and
+    `Laney33_45813` (269 bp, cov 15.0, 32 bp @ 100%, 12% query cov — weak).
+    **Cannabis is not a CEVd host, so this is contamination, not infection.**
+    CEVd is the textbook commercial-RNA-kit contaminant; 85% identity over
+    196 bp fits a kit-resident lineage that has drifted over years of
+    passaging rather than a GenBank record. Resolve with an extraction blank
+    through the same kit and check for citrus material in the lab. Do not
+    report it as a sample virus. Good candidate for a spike-in positive
+    control going forward.
+  - **Two systematic false-positive patterns account for nearly all remaining
+    apparent signal. Discard both:**
+    1. *Plastid/mitochondrial Hsp70.* Hits *Bathycoccus* BpV1/BpV2, *Dishui
+       Lake phycodnavirus 3*, *Micromonas commoda virus* "movement protein
+       hsp70h" at 72–78% in 2.1–2.6 kb contigs in **all 13 samples**. This is
+       host plastid Hsp70, not a phycodnavirus. Same for the Hsp90/Endoplasmin
+       hits (UniRef90 says Malvaceae 94%).
+    2. *Plant LTR-retrotransposons.* Gag-Pol, CCHC-type integrase,
+       phytochrome B1, *Oryza* polyprotein at 42–48%; UniRef90 independently
+       assigns every one to Cannabaceae/Asteraceae/Centaurea. This is the
+       expected RVDB endogenous-retrovirus/LTR hit rate.
+  - **geNomad "Caudoviricetes" calls with 9–12 hallmarks are unsupported** —
+    no RVDB or UniRef90 hit at all on those contigs, which a 15-gene/10-
+    hallmark DNA virus could not avoid. The recurring ~10 kb / 15 genes /
+    10 hallmarks contig at cov ~20 (15GGCany7, Laney17, Laney42, 17WC35) plus
+    26 kb / 36 genes / 12 hallmarks (Laney32) is hallmark-driven artefact on
+    plant chromatin/plastid genes — one UniRef90 hit on such a contig is
+    literally *Chromatin-remodeling complex ATPase, Asteraceae, 97.8%*. The
+    *Orthopoxvirus monkeypox* call (Laney20_13, 10131 bp, cov 316) is the same
+    category. Reinforces the standing rule: never read a marker `taxname`
+    alone as viral.
+  - A useful invariant held throughout: bowtie2 covered 100% of rows, no
+    contig had zero depth, and no header/join-key drift across the 13 files.
 - **GENOMAD takes `val db`, not `path db` (2026-09-24).** `path db` stages a
   symlink into the work dir and renders `${db}` *relative*, so any `rm` or
   `find -type f` aimed at `genomad_db/` from inside a task walks straight
@@ -161,14 +238,14 @@ Notes: blastx >> blastn for sensitivity on divergent viruses (protein diverges
   05_genomad/<sample>/{<sample>_virus_summary.tsv,<sample>_virus.fna,<sample>_virus_proteins.faa,<sample>_summary.json,*.genomad.log}
   06_bowtie2/<sample>/{*.sorted.bam,*.sorted.bam.bai,*.coverage.tsv,*.bowtie2.log}
   07_diamond/<sample>/{<sample>.rvdb.tsv,<sample>.uniref90.tsv}
-  08_multiqc/  evidence/<sample>.evidence.tsv   # 73-col joined table via bin/aggregate_evidence.sh
+  08_multiqc/  evidence/<sample>.evidence.tsv   # 72-col joined table via bin/aggregate_evidence.sh
   09_viroid/<sample>/<sample>.viroid.tsv    # blastn vs viroid DB (contigs 200-450 bp), merged into evidence
   pipeline_info/{timeline,report,trace,dag}
 ```
 
 Evidence aggregation: `bin/aggregate_evidence.sh -s <sample> -o <outdir> -d <dbdir>`
 joins geNomad + diamond RVDB/UniRef90 + protein header taxmaps + bowtie2 coverage +
-viroid blastn on contig name into a 73-col TSV (one row per union contig; repeated per
+viroid blastn on contig name into a 72-col TSV (one row per union contig; repeated per
 RVDB hit and per viroid HSP when multiple hits exist; each multi-row carries NA for the
 other multi-row leg). One-time sorted caches (`.srt`) auto-built in `<db>/blastx/` and
 `<db>/blastn/` on first run. Final rows retain stream order; only join inputs and lookup
@@ -186,7 +263,8 @@ stored beside the DB) for the evidence aggregation to join on sseqid:
 | U-RVDB-prot | complete DIAMOND `sseqid` | `<db>/blastx/U-RVDBv32.0-prot.taxmap.tsv` (rvdb id, protein accession, nucleotide accession, organism, product) — built from protein FASTA headers |
 
 Both DIAMOND legs use a custom 16-field outfmt: the standard 12 fields plus
-`qlen`, `slen`, `qcovhsp`, and `scovhsp`.
+`qlen`, `slen`, `qcovhsp`, and `scovhsp`. diamond *does* support `scovhsp` and
+*does* reject an unknown tag, so this leg cannot silently truncate.
 
 RVDB additionally ships `RVDB_AnnotationList_Current.tab.gz` (non-viral/ERV
 tags) if we want to tag Gag-Pol/LTR hits in aggregation later. RVDB protein
@@ -194,6 +272,10 @@ headers do not carry taxids or lineages, so those columns are omitted until a
 reliable protein-accession taxonomy mapping is available.
 
 blastn remains deferred; its planned outfmt is deliberately 12 columns.
+
+The viroid blastn leg uses 15 fields — the DIAMOND list **minus `scovhsp`**,
+which blastn does not have. Do not "harmonise" the two legs to 16 fields:
+blastn accepts the bad tag without complaint and simply drops the field.
 qcovs = fraction of contig matched, `length` vs `slen` = does the contig span
 the whole genome. staxids/sscinames stay blank without `makeblastdb -taxid_map`.
 
