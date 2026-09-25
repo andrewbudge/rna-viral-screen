@@ -16,7 +16,7 @@
 #   $out/06_bowtie2/<s>/<s>.coverage.tsv
 #   $out/07_diamond/<s>/<s>.rvdb.tsv
 #   $out/07_diamond/<s>/<s>.uniref90.tsv
-#   $out/09_viroid/<s>/<s>.viroid.tsv          (optional; 16-field blastn outfmt)
+#   $out/09_viroid/<s>/<s>.viroid.tsv          (optional; 15-field blastn outfmt)
 #   $db/blastx/uniref90.taxmap.tsv
 #   $db/blastx/U-RVDBv32.0-prot.taxmap.tsv
 #   $db/blastn/*_seqids.txt                    (optional; "accession<TAB-or-space>description")
@@ -26,7 +26,7 @@
 #   $db/blastx/uniref90.taxmap.srt
 #   $db/blastn/viroid_seqids.srt
 #
-# Output: $out/evidence/<s>.evidence.tsv  (73-column schema, see header)
+# Output: $out/evidence/<s>.evidence.tsv  (72-column schema, see header)
 set -euo pipefail
 export LC_ALL=C
 export TMPDIR="$PWD"
@@ -122,11 +122,53 @@ if [ ! -f "$seqids_srt" ]; then
   : > "$seqids_srt" 2>/dev/null || seqids_srt=/dev/null
 fi
 
+# ---- bowtie2 coverage: resolve the six evidence columns by name -----------
+# samtools coverage emits a '#'-prefixed header, but its column set is not
+# stable across releases (1.16 added `length`), so reading the data positionally
+# silently shifts every column when the tool is repinned. That is exactly how
+# v0.2.3 shipped with all six bowtie2_* columns off by one: each held its
+# neighbour's value, so `meandepth` was really the coverage percentage and
+# `covbases` was really the read count. Resolve by header name; fail loudly if
+# the header is missing or incomplete rather than emitting empty columns.
+if [ "$cov" != /dev/null ] && [ -s "$cov" ]; then
+  head -1 "$cov" | grep -q '^#' || {
+    echo "missing: $cov has no '#' header line; refusing to guess bowtie2 column positions" >&2
+    exit 1
+  }
+  awk -F'\t' -v OFS='\t' '
+    NR==1 {
+      sub(/^#/, "")
+      for (i=1;i<=NF;i++) ix[$i]=i
+      c[1]="numreads"; c[2]="covbases"; c[3]="coverage"
+      c[4]="meandepth"; c[5]="meanbaseq"; c[6]="meanmapq"
+      miss=""
+      for (i=1;i<=6;i++) if (!(c[i] in ix)) miss=miss " " c[i]
+      if (miss != "") {
+        print FILENAME ": coverage header is missing" miss "; refusing to emit empty bowtie2 columns" > "/dev/stderr"
+        exit 1
+      }
+      next
+    }
+    {
+      out="C\t" $1
+      for (i=1;i<=6;i++) out=out OFS $(ix[c[i]])
+      print out
+    }
+  ' "$cov" > "$tmp/cov.resolved"
+else
+  : > "$tmp/cov.resolved"
+fi
+
 # ---- rvdb hits: sseqid-keyed file -> protein FASTA header taxmap ------------
 # joined: key contig sseqid prot ntacc prod pident aln_len mismatch gapopen
 #         qstart qend sstart send evalue bitscore qlen slen qcovhsp scovhsp |
 #         prot ntacc organism product
-awk -F'\t' '{
+awk -F'\t' '
+  NF!=16 {
+    print FILENAME ": line " NR " has " NF " fields, expected 16 (diamond outfmt)" > "/dev/stderr"
+    exit 1
+  }
+  {
   split($2,a,"|");
   print $2 "\t" $1 "\t" $2 "\t" a[3] "\t" a[5] "\t" a[6] "\t" \
         $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 "\t" $9 "\t" $10 "\t" $11 "\t" $12 "\t" \
@@ -139,7 +181,12 @@ awk -F'\t' '{
 # joined: id  contig sseqid pident aln_len mismatch gapopen qstart qend
 #         sstart send evalue bitscore qlen slen qcovhsp scovhsp |
 #         taxid organism repid description
-awk -F'\t' '!seen[$1]++ {print $2"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$12"\t"$13"\t"$14"\t"$15"\t"$16}' "$u" \
+awk -F'\t' '
+  NF!=16 {
+    print FILENAME ": line " NR " has " NF " fields, expected 16 (diamond outfmt)" > "/dev/stderr"
+    exit 1
+  }
+  !seen[$1]++ {print $2"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$12"\t"$13"\t"$14"\t"$15"\t"$16}' "$u" \
   | sort -t$'\t' -k1,1 \
   | join -t$'\t' -a1 -1 1 -2 1 - "$ur90_srt" > "$tmp/ur90.joined"
 
@@ -148,16 +195,20 @@ awk -F'\t' '!seen[$1]++ {print $2"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$
 # -parse_seqids; fall back to the raw id otherwise. The small seqids cache is
 # loaded whole, so hit-stream order is preserved (join would reorder it).
 # V line: V contig sseqid acc pident aln_len mismatch gapopen qstart qend
-#         sstart send evalue bitscore qlen slen qcovhsp scovhsp description
+#         sstart send evalue bitscore qlen slen qcovhsp description
 viroid_pre="$tmp/viroid.joined"
 : > "$viroid_pre"
 if [ "$v" != /dev/null ] && [ -s "$v" ]; then
   awk -F'\t' -v OFS='\t' -v srt="$seqids_srt" '
     FILENAME==srt { d[$1]=substr($0, index($0,"\t")+1); next }
+    NF!=15 {
+      print FILENAME ": line " NR " has " NF " fields, expected 15 (blastn outfmt has no scovhsp)" > "/dev/stderr"
+      exit 1
+    }
     {
       if (index($2,"|")) { split($2,a,"|"); acc=a[2] } else acc=$2;
       desc = (acc in d) ? d[acc] : "NA";
-      print "V", $1, $2, acc, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, desc
+      print "V", $1, $2, acc, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, desc
     }
   ' "$seqids_srt" "$v" > "$viroid_pre"
 fi
@@ -167,7 +218,7 @@ fi
 # sorted because POSIX join requires sorted keys.
 {
   awk -F'\t' '$1 != "seq_name" {print "G\t" $0}' "$g"
-  awk -F'\t' '!/^#/ {print "C\t" $0}' "$cov"
+  cat "$tmp/cov.resolved"
   sed 's/^/U\t/' "$tmp/ur90.joined"
   sed 's/^/R\t/' "$tmp/rvdb.joined"
   cat "$viroid_pre"
@@ -180,7 +231,7 @@ fi
     for (i=1;i<=19;i++) rv[i]="NA"
     for (i=1;i<=19;i++) ua[i]="NA"
     for (i=1;i<=6;i++) ca[i]="NA"
-    for (i=1;i<=17;i++) vi[i]="NA"
+    for (i=1;i<=16;i++) vi[i]="NA"
 
     n=split(k,p,"_")
     len=(k in gl) ? gl[k] : "NA"
@@ -204,19 +255,18 @@ fi
     if (vhas) {
       nz=split(vline,y,FS)
       vi[1]=y[3]; vi[2]=y[4]
-      for (i=4;i<=17;i++) vi[i]=y[i+1]
-      vi[3]=(nz>=19) ? y[19] : "NA";
-      for (i=20;i<=nz;i++) vi[3]=vi[3] FS y[i]
+      for (i=4;i<=16;i++) vi[i]=y[i+1]
+      vi[3]=(nz>=18) ? y[18] : "NA";
     }
     print k,len,covv,
       ga[1],ga[2],ga[3],ga[4],ga[5],ga[6],ga[7],ga[8],ga[9],
       rv[1],rv[2],rv[3],rv[4],rv[5],rv[6],rv[7],rv[8],rv[9],rv[10],rv[11],rv[12],rv[13],rv[14],rv[15],rv[16],rv[17],rv[18],rv[19],
       ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10],ua[11],ua[12],ua[13],ua[14],ua[15],ua[16],ua[17],ua[18],ua[19],
       ca[1],ca[2],ca[3],ca[4],ca[5],ca[6],
-      vi[1],vi[2],vi[3],vi[4],vi[5],vi[6],vi[7],vi[8],vi[9],vi[10],vi[11],vi[12],vi[13],vi[14],vi[15],vi[16],vi[17]
+      vi[1],vi[2],vi[3],vi[4],vi[5],vi[6],vi[7],vi[8],vi[9],vi[10],vi[11],vi[12],vi[13],vi[14],vi[15],vi[16]
   }
   $1=="G" { add_contig($2); gl[$2]=$3; g[$2]=$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$12; next }
-  $1=="C" { add_contig($2); c[$2]=$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9; next }
+  $1=="C" { add_contig($2); c[$2]=$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8; next }
   $1=="U" {
     for (i=0;i<15;i++) ua[1+i]=$(4+i);
     for (i=19;i<=22;i++) { ua[15+i-18] = (NF>=i) ? $i : "NA" }
@@ -243,7 +293,7 @@ fi
 
 mkdir -p "$(dirname "$out")"
 cat > "$out" <<'HDR'
-contig	contig_length	contig_cov	genomad_topology	genomad_coordinates	genomad_n_genes	genomad_genetic_code	genomad_virus_score	genomad_fdr	genomad_n_hallmarks	genomad_marker_enrichment	genomad_taxonomy	rvdb_sseqid	rvdb_protein_acc	rvdb_nt_acc	rvdb_product	rvdb_pident	rvdb_aln_len	rvdb_mismatch	rvdb_gapopen	rvdb_qstart	rvdb_qend	rvdb_sstart	rvdb_send	rvdb_evalue	rvdb_bitscore	rvdb_qlen	rvdb_slen	rvdb_qcovhsp	rvdb_scovhsp	rvdb_organism	uniref90_sseqid	uniref90_pident	uniref90_aln_len	uniref90_mismatch	uniref90_gapopen	uniref90_qstart	uniref90_qend	uniref90_sstart	uniref90_send	uniref90_evalue	uniref90_bitscore	uniref90_qlen	uniref90_slen	uniref90_qcovhsp	uniref90_scovhsp	uniref90_taxid	uniref90_organism	uniref90_repid	uniref90_description	bowtie2_numreads	bowtie2_covbases	bowtie2_coverage	bowtie2_meandepth	bowtie2_meanbaseq	bowtie2_meanmapq	viroid_sseqid	viroid_accession	viroid_description	viroid_pident	viroid_aln_len	viroid_mismatch	viroid_gapopen	viroid_qstart	viroid_qend	viroid_sstart	viroid_send	viroid_evalue	viroid_bitscore	viroid_qlen	viroid_slen	viroid_qcovhsp	viroid_scovhsp
+contig	contig_length	contig_cov	genomad_topology	genomad_coordinates	genomad_n_genes	genomad_genetic_code	genomad_virus_score	genomad_fdr	genomad_n_hallmarks	genomad_marker_enrichment	genomad_taxonomy	rvdb_sseqid	rvdb_protein_acc	rvdb_nt_acc	rvdb_product	rvdb_pident	rvdb_aln_len	rvdb_mismatch	rvdb_gapopen	rvdb_qstart	rvdb_qend	rvdb_sstart	rvdb_send	rvdb_evalue	rvdb_bitscore	rvdb_qlen	rvdb_slen	rvdb_qcovhsp	rvdb_scovhsp	rvdb_organism	uniref90_sseqid	uniref90_pident	uniref90_aln_len	uniref90_mismatch	uniref90_gapopen	uniref90_qstart	uniref90_qend	uniref90_sstart	uniref90_send	uniref90_evalue	uniref90_bitscore	uniref90_qlen	uniref90_slen	uniref90_qcovhsp	uniref90_scovhsp	uniref90_taxid	uniref90_organism	uniref90_repid	uniref90_description	bowtie2_numreads	bowtie2_covbases	bowtie2_coverage	bowtie2_meandepth	bowtie2_meanbaseq	bowtie2_meanmapq	viroid_sseqid	viroid_accession	viroid_description	viroid_pident	viroid_aln_len	viroid_mismatch	viroid_gapopen	viroid_qstart	viroid_qend	viroid_sstart	viroid_send	viroid_evalue	viroid_bitscore	viroid_qlen	viroid_slen	viroid_qcovhsp
 HDR
 cat "$tmp/body" >> "$out"
 echo "wrote $out ($(($(wc -l < "$out")-1)) rows)"
